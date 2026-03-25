@@ -1152,6 +1152,8 @@ if has_legend:
 **How to read it:** Correlation values range from -1 to +1. Values close to +1 mean sensors heat up and cool down together. Values close to -1 mean inverse behavior. Values near 0 mean no relationship.
 
 **Why it matters:** Highly correlated sensors may share thermal pathways. Unexpected correlations or lack thereof can reveal insulation issues, airflow patterns, or sensor placement effects.
+
+**What is the Jaccard Index?** The Jaccard Index (shown in the Spike Co-occurrence table) measures how often two sensors spike at the same time relative to how often either one spikes. It ranges from 0 to 1 — a value of 0 means the sensors never spike together, while 1 means every spike event is shared. For example, a Jaccard Index of 0.4 means 40% of all spike events (from either sensor) occurred simultaneously. High values suggest the sensors share a common thermal influence or are physically close to the same heat source.
 """)
 
     if len(selected_sensors) >= 2:
@@ -2310,9 +2312,144 @@ def generate_pdf_report(filtered_df, alerts_df, sensor_stats, fig_temp_combined,
             style_fig(fig_corr_pdf)
             img_corr = render(fig_corr_pdf, 2400, 2000)
             temp_files.append(img_corr)
-            story.append(Image(img_corr, width=W*0.7, height=MAIN_H))
-            story.append(Paragraph("Red = strong positive correlation. Blue = negative. White = no relationship.", caption_style))
             story.append(Spacer(1, 20))
+
+            type_corr_data_pdf = []
+            for ci_idx, s1 in enumerate(selected_sensors):
+                for cj_idx, s2 in enumerate(selected_sensors):
+                    if ci_idx >= cj_idx:
+                        continue
+                    l1, l2 = pdf_label(s1), pdf_label(s2)
+                    t1 = sensor_type_map.get(s1, "Other") if sensor_type_map else "Other"
+                    t2 = sensor_type_map.get(s2, "Other") if sensor_type_map else "Other"
+                    if l1 in corr_matrix_pdf.columns and l2 in corr_matrix_pdf.columns:
+                        c_val = corr_matrix_pdf.loc[l1, l2]
+                        comp_type = "Same Type" if t1 == t2 else "Cross Type"
+                        type_corr_data_pdf.append({
+                            "Pair": f"{l1} — {l2}",
+                            "Correlation": round(c_val, 3),
+                            "Comparison": comp_type,
+                        })
+
+            if type_corr_data_pdf:
+                type_corr_df_pdf = pd.DataFrame(type_corr_data_pdf)
+                fig_type_corr_pdf = px.bar(type_corr_df_pdf, x="Pair", y="Correlation", color="Comparison",
+                    color_discrete_map={"Same Type": "#3498DB", "Cross Type": "#E8574A"},
+                    labels={"Pair": "Sensor Pair", "Correlation": "Correlation Coefficient"})
+                fig_type_corr_pdf.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1)
+                fig_type_corr_pdf.update_layout(template="plotly_white", title="Same-Type vs Cross-Type Correlation",
+                    xaxis=dict(tickangle=-45), margin=dict(l=80, r=40, t=90, b=140))
+                style_fig(fig_type_corr_pdf)
+                img_type_corr = render(fig_type_corr_pdf, 2400, 1400)
+                temp_files.append(img_type_corr)
+
+                corr_pair = Table(
+                    [[Image(img_corr, width=HALF_W, height=MAIN_H),
+                      Image(img_type_corr, width=HALF_W, height=MAIN_H)]],
+                    colWidths=[HALF_W + GAP/2, HALF_W + GAP/2])
+                corr_pair.setStyle(TableStyle([
+                    ("VALIGN", (0,0), (-1,-1), "TOP"),
+                    ("LEFTPADDING", (0,0), (-1,-1), 4),
+                    ("RIGHTPADDING", (0,0), (-1,-1), 4),
+                ]))
+                story.append(corr_pair)
+                story.append(Paragraph(
+                    "Left: Temperature correlation heatmap. Right: Same-type vs cross-type sensor pair correlations.",
+                    caption_style))
+            else:
+                story.append(Image(img_corr, width=W*0.7, height=MAIN_H))
+                story.append(Paragraph("Red = strong positive correlation. Blue = negative. White = no relationship.", caption_style))
+            story.append(Spacer(1, 20))
+
+            tm_sensors_pdf = [s for s in selected_sensors if (sensor_type_map or {}).get(s) == "TM"]
+            non_tm_pdf = [s for s in selected_sensors if (sensor_type_map or {}).get(s) in ("MSU", "Axle")]
+            if tm_sensors_pdf and non_tm_pdf:
+                tm_comp_pdf = []
+                for tm_s in tm_sensors_pdf:
+                    tm_lbl = pdf_label(tm_s)
+                    for other_s in non_tm_pdf:
+                        other_lbl = pdf_label(other_s)
+                        if tm_lbl in corr_matrix_pdf.columns and other_lbl in corr_matrix_pdf.columns:
+                            c_val = corr_matrix_pdf.loc[tm_lbl, other_lbl]
+                            tm_comp_pdf.append({
+                                "TM Sensor": tm_lbl,
+                                "Compared With": other_lbl,
+                                "Type": (sensor_type_map or {}).get(other_s, "Other"),
+                                "Correlation": round(c_val, 3),
+                            })
+                if tm_comp_pdf:
+                    tm_comp_df_pdf = pd.DataFrame(tm_comp_pdf)
+                    fig_tm_pdf = px.bar(tm_comp_df_pdf, x="Compared With", y="Correlation", color="TM Sensor",
+                        barmode="group", labels={"Compared With": "MSU/Axle Sensor", "Correlation": "Correlation"},
+                        color_discrete_sequence=px.colors.qualitative.Set2)
+                    fig_tm_pdf.update_layout(template="plotly_white", title="TM Sensors vs Nearby MSU/Axle Sensors",
+                        margin=dict(l=80, r=40, t=90, b=80))
+                    style_fig(fig_tm_pdf)
+                    img_tm = render(fig_tm_pdf, 2400, 1200)
+                    temp_files.append(img_tm)
+                    story.append(Image(img_tm, width=W*0.75, height=SIDE_H))
+                    story.append(Paragraph("TM sensor correlation with nearby MSU and Axle sensors.", caption_style))
+                    story.append(Spacer(1, 20))
+
+            spike_pivot_pdf = filtered_df.pivot_table(values="Is Spike", index="time",
+                columns="Sensor Id", aggfunc="max").fillna(False).astype(int)
+            spike_pivot_pdf.columns = [pdf_label(c) for c in spike_pivot_pdf.columns]
+            if spike_pivot_pdf.shape[1] >= 2:
+                co_occur_pdf = []
+                sp_cols = list(spike_pivot_pdf.columns)
+                for ci in range(len(sp_cols)):
+                    for cj in range(ci+1, len(sp_cols)):
+                        s1_sp = spike_pivot_pdf[sp_cols[ci]]
+                        s2_sp = spike_pivot_pdf[sp_cols[cj]]
+                        both = int((s1_sp & s2_sp).sum())
+                        either = int((s1_sp | s2_sp).sum())
+                        jaccard_val = round(both / either, 3) if either > 0 else 0
+                        co_occur_pdf.append({
+                            "Sensor A": sp_cols[ci],
+                            "Sensor B": sp_cols[cj],
+                            "Co-occurring Spikes": both,
+                            "Jaccard Index": jaccard_val,
+                        })
+                co_occur_df_pdf = pd.DataFrame(co_occur_pdf).sort_values("Co-occurring Spikes", ascending=False)
+                if co_occur_df_pdf["Co-occurring Spikes"].sum() > 0:
+                    fig_cooccur_pdf = px.bar(co_occur_df_pdf.head(15), x="Sensor A", y="Co-occurring Spikes",
+                        color="Sensor B", barmode="group",
+                        labels={"Co-occurring Spikes": "Simultaneous Spikes"},
+                        color_discrete_sequence=px.colors.qualitative.Set2)
+                    fig_cooccur_pdf.update_layout(template="plotly_white",
+                        title="Spike Co-occurrence Analysis",
+                        margin=dict(l=80, r=40, t=90, b=80))
+                    style_fig(fig_cooccur_pdf)
+                    img_cooccur = render(fig_cooccur_pdf, 2400, 1200)
+                    temp_files.append(img_cooccur)
+                    story.append(Image(img_cooccur, width=W*0.75, height=SIDE_H))
+                    story.append(Paragraph(
+                        "Sensor pairs that experience spikes at the same time. "
+                        "The Jaccard Index measures overlap: 0 = never spike together, 1 = always spike together.",
+                        caption_style))
+                    story.append(Spacer(1, 10))
+
+                    co_table_data = [["Sensor A", "Sensor B", "Co-occurring Spikes", "Jaccard Index"]]
+                    for _, row in co_occur_df_pdf.head(10).iterrows():
+                        co_table_data.append([
+                            str(row["Sensor A"]), str(row["Sensor B"]),
+                            str(int(row["Co-occurring Spikes"])), str(row["Jaccard Index"]),
+                        ])
+                    co_tbl = Table(co_table_data, colWidths=[W*0.25]*4)
+                    co_tbl.setStyle(TableStyle([
+                        ("BACKGROUND", (0,0), (-1,0), HexColor(PRIMARY)),
+                        ("TEXTCOLOR", (0,0), (-1,0), white),
+                        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+                        ("FONTSIZE", (0,0), (-1,-1), 26),
+                        ("LEADING", (0,0), (-1,-1), 36),
+                        ("ALIGN", (0,0), (-1,-1), "CENTER"),
+                        ("GRID", (0,0), (-1,-1), 0.5, HexColor(BORDER)),
+                        ("ROWBACKGROUNDS", (0,1), (-1,-1), [HexColor(BG_LIGHT), HexColor(BG_CARD)]),
+                        ("TOPPADDING", (0,0), (-1,-1), 8),
+                        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+                    ]))
+                    story.append(co_tbl)
+                    story.append(Spacer(1, 20))
 
             corr_vals = []
             cols_list_pdf = list(corr_matrix_pdf.columns)
