@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import numpy as np
 import io
 import re
 import tempfile
@@ -30,13 +31,66 @@ if uploaded_file is None:
     st.info("Please upload an Excel file with columns: **Sensor Id**, **Temperature**, **time**")
     st.stop()
 
-raw_df = pd.read_excel(uploaded_file)
+@st.cache_data(show_spinner="Reading Excel file...")
+def load_excel(file_bytes):
+    raw = pd.read_excel(io.BytesIO(file_bytes))
+    legend = None
+    try:
+        legend = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Legend_Master")
+    except (ValueError, Exception):
+        pass
+    return raw, legend
+
+try:
+    file_bytes = uploaded_file.getvalue()
+    raw_df, legend_raw_cached = load_excel(file_bytes)
+except ValueError as e:
+    if "0 worksheets found" in str(e):
+        st.error("This Excel file appears to have no worksheets. Please check that the file is not corrupted or password-protected, and try again with a valid .xlsx file.")
+    else:
+        st.error(f"Could not read the Excel file: {e}")
+    st.stop()
+except Exception as e:
+    st.error(f"Error reading file: {e}")
+    st.stop()
 
 required_columns = ["Sensor Id", "Temperature", "time"]
 missing_cols = [c for c in required_columns if c not in raw_df.columns]
 if missing_cols:
     st.error(f"Missing required columns: {', '.join(missing_cols)}")
     st.stop()
+
+legend_df = None
+has_legend = False
+legend_warnings = []
+if legend_raw_cached is not None:
+    legend_raw = legend_raw_cached.copy()
+    legend_required = ["Sl No", "Legend", "Sensor UID", "Description", "Threshold Temp"]
+    legend_missing = [c for c in legend_required if c not in legend_raw.columns]
+    if legend_missing:
+        legend_warnings.append(f"Legend_Master sheet is missing columns: {', '.join(legend_missing)}. Proceeding without legend data.")
+    else:
+        legend_raw["Threshold Temp"] = pd.to_numeric(legend_raw["Threshold Temp"], errors="coerce")
+        invalid_thresh = legend_raw["Threshold Temp"].isna().sum()
+        if invalid_thresh > 0:
+            legend_warnings.append(f"{invalid_thresh} row(s) in Legend_Master have non-numeric Threshold Temp values. These will use the default threshold ({THRESHOLD}°C).")
+        dup_legends = legend_raw["Legend"].duplicated().sum()
+        if dup_legends > 0:
+            legend_warnings.append(f"Legend_Master has {dup_legends} duplicate Legend value(s). Keeping first occurrence.")
+            legend_raw = legend_raw.drop_duplicates(subset="Legend", keep="first")
+        dup_uids = legend_raw["Sensor UID"].dropna().duplicated().sum()
+        if dup_uids > 0:
+            legend_warnings.append(f"Legend_Master has {dup_uids} duplicate Sensor UID value(s). Keeping first occurrence.")
+            legend_raw = legend_raw.drop_duplicates(subset="Sensor UID", keep="first")
+        legend_df = legend_raw
+        has_legend = True
+
+if legend_warnings:
+    for w in legend_warnings:
+        st.warning(w)
+
+if has_legend:
+    st.success(f"Legend_Master sheet loaded successfully with {len(legend_df)} sensor entries.")
 
 
 st.header("Data Quality Summary")
@@ -87,9 +141,14 @@ with st.expander("Records per Sensor"):
     st.dataframe(sensor_counts, use_container_width=True, hide_index=True)
 
 
-df = raw_df.drop_duplicates()
-df = df.dropna(subset=["Sensor Id", "Temperature", "time"])
-df = df.sort_values("time").reset_index(drop=True)
+@st.cache_data(show_spinner="Cleaning and processing data...")
+def clean_data(raw):
+    d = raw.drop_duplicates()
+    d = d.dropna(subset=["Sensor Id", "Temperature", "time"])
+    d = d.sort_values("time").reset_index(drop=True)
+    return d
+
+df = clean_data(raw_df)
 
 rows_after_clean = len(df)
 st.caption(f"After cleaning: **{rows_after_clean:,}** rows (removed {total_raw - rows_after_clean:,} rows)")
@@ -98,10 +157,71 @@ if df.empty:
     st.warning("No valid data remaining after cleaning.")
     st.stop()
 
+def derive_sensor_type(legend_str):
+    s = str(legend_str).strip().upper()
+    if s.startswith("TM"):
+        return "TM"
+    elif s.startswith("M"):
+        return "MSU"
+    elif s.startswith("A"):
+        return "Axle"
+    return "Other"
+
+sensor_legend_map = {}
+sensor_threshold_map = {}
+sensor_type_map = {}
+sensor_description_map = {}
+
+if has_legend and legend_df is not None:
+    uid_index = {}
+    legend_index = {}
+    for _, lrow in legend_df.iterrows():
+        uid = lrow["Sensor UID"]
+        leg = lrow["Legend"]
+        if pd.notna(uid):
+            uid_index[uid] = lrow
+        if pd.notna(leg):
+            legend_index[leg] = lrow
+
+    for sid in df["Sensor Id"].unique():
+        if sid in uid_index:
+            row = uid_index[sid]
+            sensor_legend_map[sid] = str(row["Legend"])
+            sensor_description_map[sid] = str(row["Description"]) if pd.notna(row["Description"]) else ""
+            sensor_threshold_map[sid] = float(row["Threshold Temp"]) if pd.notna(row["Threshold Temp"]) else THRESHOLD
+            sensor_type_map[sid] = derive_sensor_type(row["Legend"])
+        elif sid in legend_index:
+            row = legend_index[sid]
+            sensor_legend_map[sid] = str(sid)
+            sensor_description_map[sid] = str(row["Description"]) if pd.notna(row["Description"]) else ""
+            sensor_threshold_map[sid] = float(row["Threshold Temp"]) if pd.notna(row["Threshold Temp"]) else THRESHOLD
+            sensor_type_map[sid] = derive_sensor_type(sid)
+        else:
+            sensor_legend_map[sid] = str(sid)
+            sensor_threshold_map[sid] = THRESHOLD
+            sensor_type_map[sid] = "Other"
+            sensor_description_map[sid] = ""
+else:
+    for sid in df["Sensor Id"].unique():
+        sensor_legend_map[sid] = str(sid)
+        sensor_threshold_map[sid] = THRESHOLD
+        sensor_type_map[sid] = "Other"
+        sensor_description_map[sid] = ""
+
+df["Display Label"] = df["Sensor Id"].map(sensor_legend_map)
+df["Sensor Type"] = df["Sensor Id"].map(sensor_type_map)
+df["Sensor Threshold"] = df["Sensor Id"].map(sensor_threshold_map)
+
+def get_label(sensor_id):
+    return sensor_legend_map.get(sensor_id, str(sensor_id))
 
 all_sensors = sorted(df["Sensor Id"].unique().tolist())
 
-filter_col1, filter_col2 = st.columns([2, 3])
+if has_legend:
+    all_sensor_types = sorted(set(sensor_type_map.values()))
+    filter_col1, filter_col2, filter_col3 = st.columns([2, 1, 3])
+else:
+    filter_col1, filter_col2 = st.columns([2, 3])
 
 with filter_col1:
     data_min_date = df["time"].min().date()
@@ -113,8 +233,19 @@ with filter_col1:
         max_value=data_max_date,
     )
 
-with filter_col2:
-    selected_sensors = st.multiselect("Filter by Sensor", options=all_sensors, default=all_sensors)
+if has_legend:
+    with filter_col2:
+        type_options = ["All"] + all_sensor_types
+        selected_type = st.selectbox("Filter by Sensor Type", options=type_options, index=0)
+    type_filtered_sensors = [s for s in all_sensors if selected_type == "All" or sensor_type_map.get(s) == selected_type]
+    with filter_col3:
+        selected_sensors = st.multiselect(
+            "Filter by Sensor", options=type_filtered_sensors, default=type_filtered_sensors,
+            format_func=lambda x: f"{get_label(x)} ({x})" if get_label(x) != str(x) else str(x)
+        )
+else:
+    with filter_col2:
+        selected_sensors = st.multiselect("Filter by Sensor", options=all_sensors, default=all_sensors)
 
 if not selected_sensors:
     st.warning("Please select at least one sensor.")
@@ -138,24 +269,25 @@ filtered_min_ts = filtered_df["time"].min()
 filtered_max_ts = filtered_df["time"].max()
 
 
-def compute_crossing_alerts(data, threshold=THRESHOLD):
-    alerts = []
-    for sensor_id, group in data.groupby("Sensor Id"):
-        group = group.sort_values("time")
-        above = False
-        for _, row in group.iterrows():
-            if row["Temperature"] > threshold and not above:
-                alerts.append({
-                    "Sensor Id": sensor_id,
-                    "Alert Time": row["time"],
-                    "Temperature": row["Temperature"],
-                })
-                above = True
-            elif row["Temperature"] <= threshold:
-                above = False
-    return pd.DataFrame(alerts)
+def compute_crossing_alerts(data, threshold=THRESHOLD, per_sensor_thresholds=None):
+    data = data.sort_values(["Sensor Id", "time"])
+    if per_sensor_thresholds:
+        thresholds = data["Sensor Id"].map(per_sensor_thresholds).fillna(threshold)
+    else:
+        thresholds = threshold
+    above = data["Temperature"] > thresholds
+    prev_above = above.groupby(data["Sensor Id"]).shift(1, fill_value=False)
+    crossings = above & ~prev_above
+    alert_rows = data[crossings].copy()
+    if alert_rows.empty:
+        return pd.DataFrame(columns=["Sensor Id", "Alert Time", "Temperature", "Threshold"])
+    if per_sensor_thresholds:
+        alert_rows["Threshold"] = alert_rows["Sensor Id"].map(per_sensor_thresholds).fillna(threshold)
+    else:
+        alert_rows["Threshold"] = threshold
+    return alert_rows[["Sensor Id", "time", "Temperature", "Threshold"]].rename(columns={"time": "Alert Time"}).reset_index(drop=True)
 
-alerts_df = compute_crossing_alerts(filtered_df)
+alerts_df = compute_crossing_alerts(filtered_df, THRESHOLD, sensor_threshold_map if has_legend else None)
 total_alerts = len(alerts_df)
 total_records = len(filtered_df)
 alert_pct = (total_alerts / total_records * 100) if total_records > 0 else 0
@@ -173,6 +305,9 @@ spike_count = int(filtered_df["Is Spike"].sum())
 
 sensor_stats = filtered_df.groupby("Sensor Id")["Temperature"].agg(["min", "max", "mean"]).reset_index()
 sensor_stats.columns = ["Sensor Id", "Min Temp (°C)", "Max Temp (°C)", "Avg Temp (°C)"]
+sensor_stats["Display Label"] = sensor_stats["Sensor Id"].map(sensor_legend_map)
+sensor_stats["Sensor Type"] = sensor_stats["Sensor Id"].map(sensor_type_map)
+sensor_stats["Sensor Threshold"] = sensor_stats["Sensor Id"].map(sensor_threshold_map)
 sensor_stats["Avg Temp (°C)"] = sensor_stats["Avg Temp (°C)"].round(2)
 
 if not alerts_df.empty:
@@ -187,6 +322,19 @@ sensor_stats = sensor_stats.merge(spike_per_sensor, on="Sensor Id", how="left")
 sensor_stats["Spike Events"] = sensor_stats["Spike Events"].fillna(0).astype(int)
 
 colors = px.colors.qualitative.Set2
+
+MAX_POINTS_PER_TRACE = 2000
+
+def downsample_sensor(sensor_data, max_points=MAX_POINTS_PER_TRACE):
+    if len(sensor_data) <= max_points:
+        return sensor_data
+    step = max(1, len(sensor_data) // max_points)
+    sampled = sensor_data.iloc[::step]
+    idx_min = sensor_data["Temperature"].idxmin()
+    idx_max = sensor_data["Temperature"].idxmax()
+    extras = sensor_data.loc[[idx_min, idx_max]]
+    result = pd.concat([sampled, extras]).drop_duplicates().sort_values("time")
+    return result
 
 
 st.header("Key Performance Indicators")
@@ -209,8 +357,16 @@ kpi2.metric("Total Records", f"{total_records:,}")
 kpi3.metric("Alert Events", f"{total_alerts}")
 kpi4.metric("Alert Rate", f"{alert_pct:.2f}%")
 kpi5.metric("Spike Events", f"{spike_count}")
-kpi6.metric("Threshold", f"{THRESHOLD}°C")
-st.caption("Alert Events = threshold crossings (>80°C). Spike Events = rapid temperature changes (>±5°C between readings).")
+if has_legend:
+    unique_thresh_vals = sorted(set(sensor_threshold_map.values()))
+    if len(unique_thresh_vals) == 1:
+        kpi6.metric("Threshold", f"{unique_thresh_vals[0]:.0f}°C")
+    else:
+        kpi6.metric("Thresholds", f"{min(unique_thresh_vals):.0f}–{max(unique_thresh_vals):.0f}°C")
+    st.caption(f"Alert Events = per-sensor threshold crossings (thresholds: {', '.join(f'{v:.0f}°C' for v in unique_thresh_vals)}). Spike Events = rapid temperature changes (>±5°C between readings).")
+else:
+    kpi6.metric("Threshold", f"{THRESHOLD}°C")
+    st.caption("Alert Events = threshold crossings (>80°C). Spike Events = rapid temperature changes (>±5°C between readings).")
 
 
 st.header("Operational Insights")
@@ -245,8 +401,8 @@ if spike_count > 0:
 else:
     insights.append("✅ **Stable temperature behavior** — No significant rapid temperature changes detected.")
 
-insights.append(f"🌡️ **Sensor {max_temp_sensor['Sensor Id']}** recorded the highest maximum temperature at **{max_temp_sensor['Max Temp (°C)']:.1f}°C**.")
-insights.append(f"⚡ **Sensor {max_spike_sensor['Sensor Id']}** showed the highest variability with **{int(max_spike_sensor['Spike Events'])} spike events**.")
+insights.append(f"🌡️ **{get_label(max_temp_sensor['Sensor Id'])}** recorded the highest maximum temperature at **{max_temp_sensor['Max Temp (°C)']:.1f}°C**.")
+insights.append(f"⚡ **{get_label(max_spike_sensor['Sensor Id'])}** showed the highest variability with **{int(max_spike_sensor['Spike Events'])} spike events**.")
 
 if time_clustering_text:
     insights.append(f"🕐 {time_clustering_text}")
@@ -310,12 +466,14 @@ if use_small_multiples:
             fig_sm.add_hrect(y0=SAFE_LIMIT, y1=WARNING_LIMIT, fillcolor="orange", opacity=0.07, line_width=0)
             fig_sm.add_hrect(y0=WARNING_LIMIT, y1=y_max * 1.1, fillcolor="red", opacity=0.07, line_width=0)
 
-            fig_sm.add_trace(go.Scatter(x=sensor_data["time"], y=sensor_data["Temperature"],
+            s_thresh = sensor_threshold_map.get(sensor_id, THRESHOLD)
+            ds = downsample_sensor(sensor_data)
+            fig_sm.add_trace(go.Scatter(x=ds["time"], y=ds["Temperature"],
                                          mode="lines", name="Temp", line=dict(color=color, width=1.5)))
-            fig_sm.add_trace(go.Scatter(x=sensor_data["time"], y=sensor_data["Rolling Avg"],
+            fig_sm.add_trace(go.Scatter(x=ds["time"], y=ds["Rolling Avg"],
                                          mode="lines", name="Rolling Avg", line=dict(color=color, width=2.5, dash="dot")))
-            fig_sm.add_hline(y=THRESHOLD, line_dash="dash", line_color="red", line_width=1.5)
-            fig_sm.update_layout(title=f"Sensor {sensor_id}", height=300, template="plotly_white",
+            fig_sm.add_hline(y=s_thresh, line_dash="dash", line_color="red", line_width=1.5)
+            fig_sm.update_layout(title=f"{get_label(sensor_id)}", height=300, template="plotly_white",
                                   showlegend=False, margin=dict(l=40, r=10, t=40, b=30),
                                   yaxis=dict(range=[0, y_max * 1.1]))
             with cols[col_idx]:
@@ -331,14 +489,22 @@ else:
                        annotation_text="Critical Zone", annotation_position="top left", line_width=0)
     for i, sensor_id in enumerate(selected_sensors):
         sensor_data = filtered_df[filtered_df["Sensor Id"] == sensor_id]
+        ds = downsample_sensor(sensor_data)
         color = colors[i % len(colors)]
-        fig_temp.add_trace(go.Scatter(x=sensor_data["time"], y=sensor_data["Temperature"],
-                                       mode="lines", name=str(sensor_id), line=dict(color=color, width=1.5), opacity=0.7))
-        fig_temp.add_trace(go.Scatter(x=sensor_data["time"], y=sensor_data["Rolling Avg"],
-                                       mode="lines", name=f"{sensor_id} (Avg)",
+        label = get_label(sensor_id)
+        fig_temp.add_trace(go.Scatter(x=ds["time"], y=ds["Temperature"],
+                                       mode="lines", name=label, line=dict(color=color, width=1.5), opacity=0.7))
+        fig_temp.add_trace(go.Scatter(x=ds["time"], y=ds["Rolling Avg"],
+                                       mode="lines", name=f"{label} (Avg)",
                                        line=dict(color=color, width=2.5, dash="dot"), opacity=0.9))
-    fig_temp.add_hline(y=THRESHOLD, line_dash="dash", line_color="red", line_width=2,
-                       annotation_text=f"Threshold ({THRESHOLD}°C)", annotation_position="top right")
+    if has_legend:
+        unique_thresholds = set(sensor_threshold_map.get(s, THRESHOLD) for s in selected_sensors)
+        for t_val in sorted(unique_thresholds):
+            fig_temp.add_hline(y=t_val, line_dash="dash", line_color="red", line_width=2,
+                               annotation_text=f"Threshold ({t_val}°C)", annotation_position="top right")
+    else:
+        fig_temp.add_hline(y=THRESHOLD, line_dash="dash", line_color="red", line_width=2,
+                           annotation_text=f"Threshold ({THRESHOLD}°C)", annotation_position="top right")
     fig_temp.update_layout(xaxis_title="Time", yaxis_title="Temperature (°C)", height=500, template="plotly_white",
                             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                             margin=dict(l=60, r=30, t=60, b=60))
@@ -346,25 +512,19 @@ else:
 
 st.caption("Use this chart to understand how temperature changes over time and identify patterns across sensors.")
 
-fig_temp_combined = go.Figure()
-y_max = max(filtered_df["Temperature"].max(), 120)
-fig_temp_combined.add_hrect(y0=0, y1=SAFE_LIMIT, fillcolor="green", opacity=0.07, line_width=0)
-fig_temp_combined.add_hrect(y0=SAFE_LIMIT, y1=WARNING_LIMIT, fillcolor="orange", opacity=0.07, line_width=0)
-fig_temp_combined.add_hrect(y0=WARNING_LIMIT, y1=y_max * 1.1, fillcolor="red", opacity=0.07, line_width=0)
-for i, sensor_id in enumerate(selected_sensors):
-    sensor_data = filtered_df[filtered_df["Sensor Id"] == sensor_id]
-    color = colors[i % len(colors)]
-    fig_temp_combined.add_trace(go.Scatter(x=sensor_data["time"], y=sensor_data["Temperature"],
-                                            mode="lines", name=str(sensor_id), line=dict(color=color, width=1.5), opacity=0.7))
-    fig_temp_combined.add_trace(go.Scatter(x=sensor_data["time"], y=sensor_data["Rolling Avg"],
-                                            mode="lines", name=f"{sensor_id} (Avg)",
-                                            line=dict(color=color, width=2.5, dash="dot"), opacity=0.9))
-fig_temp_combined.add_hline(y=THRESHOLD, line_dash="dash", line_color="red", line_width=2,
-                             annotation_text=f"Threshold ({THRESHOLD}°C)", annotation_position="top right")
-fig_temp_combined.update_layout(xaxis_title="Time", yaxis_title="Temperature (°C)", height=500, template="plotly_white",
-                                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                                 margin=dict(l=60, r=30, t=60, b=60))
-
+temp_takeaway_parts = []
+hottest_sensor = sensor_stats.loc[sensor_stats["Max Temp (°C)"].idxmax()]
+temp_takeaway_parts.append(f"**{hottest_sensor['Display Label']}** recorded the highest temperature at **{hottest_sensor['Max Temp (°C)']:.1f}°C**.")
+avg_temps = sensor_stats["Avg Temp (°C)"]
+temp_spread = avg_temps.max() - avg_temps.min()
+if temp_spread > 10:
+    temp_takeaway_parts.append(f"Significant temperature spread of **{temp_spread:.1f}°C** between sensor averages — investigate sensors operating at different thermal levels.")
+elif temp_spread < 3:
+    temp_takeaway_parts.append(f"Sensors operate within a tight **{temp_spread:.1f}°C** average range — consistent thermal behavior across the fleet.")
+sensors_above = sensor_stats[sensor_stats["Max Temp (°C)"] > THRESHOLD]
+if len(sensors_above) > 0:
+    temp_takeaway_parts.append(f"**{len(sensors_above)} of {len(sensor_stats)}** sensors exceeded the alert threshold during the monitoring period.")
+st.info("📌 **Key Takeaway:** " + " ".join(temp_takeaway_parts))
 
 st.header("Temperature Distribution")
 st.markdown("_This section shows how temperature readings are distributed across all sensors, helping identify common operating ranges and outliers._")
@@ -393,13 +553,23 @@ with dist_col1:
 
 with dist_col2:
     st.subheader("Box Plot per Sensor")
-    fig_box = px.box(filtered_df, x="Sensor Id", y="Temperature", color="Sensor Id",
+    fig_box = px.box(filtered_df, x="Display Label", y="Temperature", color="Display Label",
                       color_discrete_sequence=px.colors.qualitative.Set2)
     fig_box.add_hline(y=THRESHOLD, line_dash="dash", line_color="red", line_width=2)
     fig_box.update_layout(height=400, template="plotly_white", showlegend=False,
                            margin=dict(l=40, r=20, t=40, b=40))
     st.plotly_chart(fig_box, use_container_width=True)
     st.caption("Compare the temperature range and spread across sensors. Wider boxes indicate more variability.")
+
+dist_takeaway_parts = []
+median_temps = filtered_df.groupby("Display Label")["Temperature"].median()
+highest_median_sensor = median_temps.idxmax()
+lowest_median_sensor = median_temps.idxmin()
+dist_takeaway_parts.append(f"**{highest_median_sensor}** has the highest median temperature ({median_temps.max():.1f}°C) while **{lowest_median_sensor}** has the lowest ({median_temps.min():.1f}°C).")
+std_devs = filtered_df.groupby("Display Label")["Temperature"].std()
+most_variable = std_devs.idxmax()
+dist_takeaway_parts.append(f"**{most_variable}** shows the most temperature variability (σ = {std_devs.max():.1f}°C) — may indicate inconsistent thermal load or cooling issues.")
+st.info("📌 **Key Takeaway:** " + " ".join(dist_takeaway_parts))
 
 
 st.header("Rate of Change Analysis")
@@ -419,13 +589,15 @@ fig_roc = go.Figure()
 for i, sensor_id in enumerate(selected_sensors):
     sensor_data = filtered_df[filtered_df["Sensor Id"] == sensor_id]
     color = colors[i % len(colors)]
+    label = get_label(sensor_id)
     normal = sensor_data[~sensor_data["Is Spike"]]
     spikes = sensor_data[sensor_data["Is Spike"]]
-    fig_roc.add_trace(go.Scatter(x=normal["time"], y=normal["Temp Change"], mode="markers", name=str(sensor_id),
+    ds_normal = downsample_sensor(normal) if len(normal) > MAX_POINTS_PER_TRACE else normal
+    fig_roc.add_trace(go.Scatter(x=ds_normal["time"], y=ds_normal["Temp Change"], mode="markers", name=label,
                                   marker=dict(color=color, size=3, opacity=0.5)))
     if not spikes.empty:
         fig_roc.add_trace(go.Scatter(x=spikes["time"], y=spikes["Temp Change"], mode="markers",
-                                      name=f"{sensor_id} (Spikes)",
+                                      name=f"{label} (Spikes)",
                                       marker=dict(color="red", size=8, symbol="diamond", opacity=0.9)))
 fig_roc.add_hline(y=SPIKE_THRESHOLD_RATE, line_dash="dot", line_color="red", line_width=1,
                   annotation_text=f"+{SPIKE_THRESHOLD_RATE}°C")
@@ -436,6 +608,21 @@ fig_roc.update_layout(xaxis_title="Time", yaxis_title="Temperature Change (°C)"
                        margin=dict(l=60, r=30, t=60, b=60))
 st.plotly_chart(fig_roc, use_container_width=True)
 st.caption(f"Spike events detected (change > ±{SPIKE_THRESHOLD_RATE}°C between readings): **{spike_count}**. Red diamonds highlight these rapid changes.")
+
+roc_takeaway_parts = []
+if spike_count > 0:
+    max_change = filtered_df["Temp Change"].abs().max()
+    max_change_row = filtered_df.loc[filtered_df["Temp Change"].abs().idxmax()]
+    roc_takeaway_parts.append(f"The largest single temperature change was **{max_change:.1f}°C** from sensor **{get_label(max_change_row['Sensor Id'])}**.")
+    spike_pct = spike_count / total_records * 100
+    roc_takeaway_parts.append(f"**{spike_count}** spike events detected across **{total_records:,}** readings ({spike_pct:.2f}% instability rate).")
+    if spike_pct > 5:
+        roc_takeaway_parts.append("High instability rate — investigate root causes of frequent rapid temperature changes.")
+    elif spike_pct < 1:
+        roc_takeaway_parts.append("Low instability rate — temperature changes are generally gradual and well-controlled.")
+else:
+    roc_takeaway_parts.append("No spike events detected — all temperature transitions were gradual and within normal rates.")
+st.info("📌 **Key Takeaway:** " + " ".join(roc_takeaway_parts))
 
 
 st.header("Spike Analysis")
@@ -454,10 +641,9 @@ spike_col1, spike_col2 = st.columns(2)
 with spike_col1:
     st.subheader("Spike Count per Sensor")
     spike_sensor_df = sensor_stats.copy()
-    spike_sensor_df["Sensor Id"] = spike_sensor_df["Sensor Id"].astype(str)
-    fig_spike_sensor = px.bar(spike_sensor_df, x="Sensor Id", y="Spike Events",
+    fig_spike_sensor = px.bar(spike_sensor_df, x="Display Label", y="Spike Events",
                                color="Spike Events", color_continuous_scale="YlOrRd",
-                               labels={"Spike Events": "Number of Spikes"})
+                               labels={"Spike Events": "Number of Spikes", "Display Label": "Sensor"})
     fig_spike_sensor.update_layout(height=400, template="plotly_white", margin=dict(l=40, r=20, t=40, b=40),
                                     xaxis_type="category")
     st.plotly_chart(fig_spike_sensor, use_container_width=True)
@@ -477,6 +663,23 @@ with spike_col2:
         st.caption("This chart shows how spike events are distributed over time. Clusters may indicate operational patterns.")
     else:
         st.info("No spike events detected.")
+
+spike_takeaway_parts = []
+if spike_count > 0:
+    spikes_per_sensor = sensor_stats[["Display Label", "Spike Events"]].sort_values("Spike Events", ascending=False)
+    top_spike_sensor = spikes_per_sensor.iloc[0]
+    spike_takeaway_parts.append(f"**{top_spike_sensor['Display Label']}** leads with **{int(top_spike_sensor['Spike Events'])}** spike events.")
+    sensors_with_spikes = int((spikes_per_sensor["Spike Events"] > 0).sum())
+    spike_takeaway_parts.append(f"**{sensors_with_spikes} of {len(spikes_per_sensor)}** sensors experienced at least one spike event.")
+    if not spike_df_times.empty:
+        spike_df_times_copy = spike_df_times.copy()
+        spike_df_times_copy["Date"] = spike_df_times_copy["time"].dt.date
+        worst_day = spike_df_times_copy.groupby("Date").size().idxmax()
+        worst_day_count = spike_df_times_copy.groupby("Date").size().max()
+        spike_takeaway_parts.append(f"Peak spike activity occurred on **{worst_day}** with **{worst_day_count}** events.")
+else:
+    spike_takeaway_parts.append("No spike events detected — all temperature transitions remained within normal rates across all sensors.")
+st.info("📌 **Key Takeaway:** " + " ".join(spike_takeaway_parts))
 
 
 st.header("Alert Summary")
@@ -503,9 +706,10 @@ with alert_chart_col1:
     st.subheader("Alerts per Sensor")
     if not alerts_df.empty:
         alerts_per_sensor = alerts_df.groupby("Sensor Id").size().reset_index(name="Alert Events")
-        alerts_per_sensor["Sensor Id"] = alerts_per_sensor["Sensor Id"].astype(str)
-        fig_alerts_sensor = px.bar(alerts_per_sensor, x="Sensor Id", y="Alert Events",
-                                    color="Alert Events", color_continuous_scale="Reds")
+        alerts_per_sensor["Display Label"] = alerts_per_sensor["Sensor Id"].map(sensor_legend_map)
+        fig_alerts_sensor = px.bar(alerts_per_sensor, x="Display Label", y="Alert Events",
+                                    color="Alert Events", color_continuous_scale="Reds",
+                                    labels={"Display Label": "Sensor"})
         fig_alerts_sensor.update_layout(height=400, template="plotly_white", margin=dict(l=40, r=20, t=40, b=40),
                                          xaxis_type="category")
         st.plotly_chart(fig_alerts_sensor, use_container_width=True)
@@ -544,6 +748,20 @@ if not alerts_df.empty:
 else:
     st.info("No alert events to display monthly trend.")
 
+alert_takeaway_parts = []
+if total_alerts > 0:
+    alerts_per_sensor_df = sensor_stats[["Display Label", "Alert Events"]].sort_values("Alert Events", ascending=False)
+    top_alert_sensor = alerts_per_sensor_df.iloc[0]
+    alert_takeaway_parts.append(f"**{int(top_alert_sensor['Alert Events'])}** alert events detected across **{len(alerts_per_sensor_df[alerts_per_sensor_df['Alert Events'] > 0])}** sensors.")
+    alert_takeaway_parts.append(f"**{top_alert_sensor['Display Label']}** has the most alerts with **{int(top_alert_sensor['Alert Events'])}** threshold crossing events.")
+    if alert_pct > 5:
+        alert_takeaway_parts.append("Alert rate exceeds 5% — systematic thermal issues require investigation.")
+    elif alert_pct < 1:
+        alert_takeaway_parts.append("Alert rate below 1% — threshold crossings are infrequent and may be transient.")
+else:
+    alert_takeaway_parts.append("No alert events detected — all sensors remained within safe operating limits throughout the monitoring period.")
+st.info("📌 **Key Takeaway:** " + " ".join(alert_takeaway_parts))
+
 
 st.header("Sensor Rankings")
 st.markdown("_Compare sensors to identify which ones require the most attention based on alerts, spikes, and peak temperatures._")
@@ -560,24 +778,37 @@ rank_col1, rank_col2, rank_col3 = st.columns(3)
 
 with rank_col1:
     st.subheader("By Alert Count")
-    alert_rank = sensor_stats[["Sensor Id", "Alert Events"]].sort_values("Alert Events", ascending=False).reset_index(drop=True)
+    alert_rank = sensor_stats[["Display Label", "Alert Events"]].sort_values("Alert Events", ascending=False).reset_index(drop=True)
     alert_rank.index = alert_rank.index + 1
     alert_rank.index.name = "Rank"
     st.dataframe(alert_rank, use_container_width=True)
 
 with rank_col2:
     st.subheader("By Spike Count")
-    spike_rank = sensor_stats[["Sensor Id", "Spike Events"]].sort_values("Spike Events", ascending=False).reset_index(drop=True)
+    spike_rank = sensor_stats[["Display Label", "Spike Events"]].sort_values("Spike Events", ascending=False).reset_index(drop=True)
     spike_rank.index = spike_rank.index + 1
     spike_rank.index.name = "Rank"
     st.dataframe(spike_rank, use_container_width=True)
 
 with rank_col3:
     st.subheader("By Max Temperature")
-    max_temp_rank = sensor_stats[["Sensor Id", "Max Temp (°C)"]].sort_values("Max Temp (°C)", ascending=False).reset_index(drop=True)
+    max_temp_rank = sensor_stats[["Display Label", "Max Temp (°C)"]].sort_values("Max Temp (°C)", ascending=False).reset_index(drop=True)
     max_temp_rank.index = max_temp_rank.index + 1
     max_temp_rank.index.name = "Rank"
     st.dataframe(max_temp_rank, use_container_width=True)
+
+rank_takeaway_parts = []
+alert_top = sensor_stats.loc[sensor_stats["Alert Events"].idxmax()]
+spike_top = sensor_stats.loc[sensor_stats["Spike Events"].idxmax()]
+temp_top = sensor_stats.loc[sensor_stats["Max Temp (°C)"].idxmax()]
+if alert_top["Display Label"] == spike_top["Display Label"] == temp_top["Display Label"]:
+    rank_takeaway_parts.append(f"**{alert_top['Display Label']}** ranks #1 across all three categories (alerts, spikes, and max temperature) — this sensor requires priority attention.")
+else:
+    top_sensors = set([alert_top["Display Label"], spike_top["Display Label"], temp_top["Display Label"]])
+    rank_takeaway_parts.append(f"Top-ranked sensors: **{alert_top['Display Label']}** (most alerts), **{spike_top['Display Label']}** (most spikes), **{temp_top['Display Label']}** (highest peak temperature).")
+    if len(top_sensors) > 2:
+        rank_takeaway_parts.append("Risk is spread across multiple sensors — review each for different failure modes.")
+st.info("📌 **Key Takeaway:** " + " ".join(rank_takeaway_parts))
 
 
 st.header("Sensor Summary")
@@ -590,8 +821,26 @@ with st.expander("ℹ️ How to read the sensor summary"):
 
 **Why it matters:** Provides a single reference point for comparing all sensors side by side.
 """)
-st.dataframe(sensor_stats, use_container_width=True, hide_index=True)
+sensor_summary_display = sensor_stats.copy()
+if has_legend:
+    display_cols = ["Display Label", "Sensor Type", "Min Temp (°C)", "Max Temp (°C)", "Avg Temp (°C)", "Sensor Threshold", "Alert Events", "Spike Events"]
+    display_cols = [c for c in display_cols if c in sensor_summary_display.columns]
+else:
+    display_cols = ["Sensor Id", "Min Temp (°C)", "Max Temp (°C)", "Avg Temp (°C)", "Alert Events", "Spike Events"]
+st.dataframe(sensor_summary_display[display_cols], use_container_width=True, hide_index=True)
 st.caption("This table provides a comprehensive comparison of all monitored sensors.")
+
+summary_takeaway_parts = []
+total_sensor_count = len(sensor_stats)
+problematic = sensor_stats[(sensor_stats["Alert Events"] > 0) | (sensor_stats["Spike Events"] > 0)]
+if len(problematic) > 0:
+    summary_takeaway_parts.append(f"**{len(problematic)} of {total_sensor_count}** sensors have recorded at least one alert or spike event.")
+    clean_sensors = total_sensor_count - len(problematic)
+    if clean_sensors > 0:
+        summary_takeaway_parts.append(f"**{clean_sensors}** sensors maintained clean records with no alerts or spikes throughout the monitoring period.")
+else:
+    summary_takeaway_parts.append(f"All **{total_sensor_count}** sensors maintained clean records — no alerts or spikes detected across the entire monitoring period.")
+st.info("📌 **Key Takeaway:** " + " ".join(summary_takeaway_parts))
 
 
 st.header("Temperature Heatmap")
@@ -614,7 +863,8 @@ if time_range > 48:
 else:
     heatmap_df["Time Bucket"] = heatmap_df["time"].dt.floor("h")
 
-heatmap_pivot = heatmap_df.pivot_table(values="Temperature", index="Sensor Id", columns="Time Bucket", aggfunc="mean")
+heatmap_df["Display Label"] = heatmap_df["Sensor Id"].map(sensor_legend_map)
+heatmap_pivot = heatmap_df.pivot_table(values="Temperature", index="Display Label", columns="Time Bucket", aggfunc="mean")
 
 if not heatmap_pivot.empty:
     fig_heatmap = px.imshow(
@@ -634,6 +884,17 @@ if not heatmap_pivot.empty:
     )
     st.plotly_chart(fig_heatmap, use_container_width=True)
     st.caption("Higher intensity (red/orange) indicates higher temperature concentration. Green areas indicate cooler, safer operating conditions.")
+
+    heatmap_takeaway_parts = []
+    heatmap_max_sensor = heatmap_pivot.max(axis=1).idxmax()
+    heatmap_max_time = heatmap_pivot.max(axis=0).idxmax()
+    heatmap_takeaway_parts.append(f"Hottest sensor across all time periods: **{heatmap_max_sensor}** (peak avg: {heatmap_pivot.max(axis=1).max():.1f}°C).")
+    heatmap_takeaway_parts.append(f"Hottest time period: **{str(heatmap_max_time)[:16]}** (peak avg: {heatmap_pivot.max(axis=0).max():.1f}°C across sensors).")
+    row_range = heatmap_pivot.max(axis=1) - heatmap_pivot.min(axis=1)
+    most_variable_hm = row_range.idxmax()
+    if row_range.max() > 5:
+        heatmap_takeaway_parts.append(f"**{most_variable_hm}** shows the widest temperature swing ({row_range.max():.1f}°C range) across time periods.")
+    st.info("📌 **Key Takeaway:** " + " ".join(heatmap_takeaway_parts))
 else:
     st.info("Not enough data to generate heatmap.")
 
@@ -762,7 +1023,7 @@ with st.expander("ℹ️ How to read the time-of-day heatmap"):
 **What to look for:** Horizontal bands of warm colors indicate sensors that are consistently hot. Vertical bands indicate hours when all sensors run hot together.
 """)
 
-tod_heatmap = filtered_df.pivot_table(values="Temperature", index="Sensor Id", columns="Hour", aggfunc="mean")
+tod_heatmap = filtered_df.pivot_table(values="Temperature", index="Display Label", columns="Hour", aggfunc="mean")
 if not tod_heatmap.empty:
     fig_tod_heatmap = px.imshow(
         tod_heatmap.values,
@@ -796,6 +1057,231 @@ if not daily_avg.empty:
     st.markdown(f"- 📅 **Hottest day of week:** {peak_day['Day']} with an average of {peak_day['Avg Temperature (°C)']:.1f}°C")
 
 
+if has_legend:
+    st.header("Threshold Analysis")
+    st.markdown("_Per-sensor threshold analysis using uploaded threshold values from the Legend_Master sheet._")
+    with st.expander("ℹ️ What is threshold analysis?"):
+        st.markdown("""
+**What it shows:** Detailed threshold breach analysis using per-sensor threshold values from the Legend_Master sheet.
+
+**How to read it:** Each sensor has its own threshold. This section shows which sensors breach their specific thresholds and by how much.
+
+**Why it matters:** Different sensor types may have different safe operating limits. Per-sensor thresholds provide more accurate breach detection.
+""")
+
+    thresh_col1, thresh_col2 = st.columns(2)
+    with thresh_col1:
+        st.subheader("Breach Count by Sensor")
+        breach_data = []
+        for sid in selected_sensors:
+            s_data = filtered_df[filtered_df["Sensor Id"] == sid]
+            s_thresh = sensor_threshold_map.get(sid, THRESHOLD)
+            breach_count = int((s_data["Temperature"] > s_thresh).sum())
+            breach_data.append({
+                "Sensor": get_label(sid),
+                "Threshold (°C)": s_thresh,
+                "Breach Count": breach_count,
+                "Max Temp (°C)": round(s_data["Temperature"].max(), 1),
+                "Margin (°C)": round(s_data["Temperature"].max() - s_thresh, 1),
+            })
+        breach_df = pd.DataFrame(breach_data)
+        fig_breach = px.bar(breach_df, x="Sensor", y="Breach Count",
+                             color="Breach Count", color_continuous_scale="Reds",
+                             labels={"Sensor": "Sensor", "Breach Count": "Readings Above Threshold"})
+        fig_breach.update_layout(height=400, template="plotly_white", xaxis_type="category",
+                                  margin=dict(l=40, r=20, t=40, b=40))
+        st.plotly_chart(fig_breach, use_container_width=True)
+
+    with thresh_col2:
+        st.subheader("Max Temperature vs Threshold")
+        fig_max_vs_thresh = go.Figure()
+        sensors_sorted = sorted(selected_sensors, key=lambda s: sensor_stats[sensor_stats["Sensor Id"]==s]["Max Temp (°C)"].values[0], reverse=True)
+        labels_sorted = [get_label(s) for s in sensors_sorted]
+        max_temps = [sensor_stats[sensor_stats["Sensor Id"]==s]["Max Temp (°C)"].values[0] for s in sensors_sorted]
+        thresholds = [sensor_threshold_map.get(s, THRESHOLD) for s in sensors_sorted]
+        fig_max_vs_thresh.add_trace(go.Bar(x=labels_sorted, y=max_temps, name="Max Temperature",
+                                            marker_color="#3498DB"))
+        fig_max_vs_thresh.add_trace(go.Scatter(x=labels_sorted, y=thresholds, name="Threshold",
+                                                mode="markers+lines", line=dict(color="red", width=2, dash="dash"),
+                                                marker=dict(color="red", size=10)))
+        fig_max_vs_thresh.update_layout(height=400, template="plotly_white", barmode="group",
+                                          yaxis_title="Temperature (°C)",
+                                          legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                                          margin=dict(l=40, r=20, t=60, b=40))
+        st.plotly_chart(fig_max_vs_thresh, use_container_width=True)
+
+    st.subheader("Top Recurring Threshold Breaches")
+    recurring_data = []
+    for sid in selected_sensors:
+        s_data = filtered_df[filtered_df["Sensor Id"] == sid].sort_values("time")
+        s_thresh = sensor_threshold_map.get(sid, THRESHOLD)
+        above_mask = s_data["Temperature"] > s_thresh
+        crossings = int((above_mask & ~above_mask.shift(1, fill_value=False)).sum())
+        recurring_data.append({
+            "Sensor": get_label(sid),
+            "Threshold (°C)": s_thresh,
+            "Crossing Events": crossings,
+            "Readings Above": int(above_mask.sum()),
+            "% Above": round(above_mask.mean() * 100, 2),
+        })
+    recurring_df = pd.DataFrame(recurring_data).sort_values("Crossing Events", ascending=False)
+    st.dataframe(recurring_df, use_container_width=True, hide_index=True)
+    st.caption("Sensors sorted by number of threshold crossing events. Higher crossing counts indicate recurring thermal issues.")
+
+    thresh_takeaway_parts = []
+    total_breaches = breach_df["Breach Count"].sum()
+    if total_breaches > 0:
+        worst_breach = breach_df.loc[breach_df["Breach Count"].idxmax()]
+        thresh_takeaway_parts.append(f"**{int(total_breaches)}** total threshold breach readings detected.")
+        thresh_takeaway_parts.append(f"**{worst_breach['Sensor']}** has the most breaches (**{int(worst_breach['Breach Count'])}** readings above its {worst_breach['Threshold (°C)']}°C threshold).")
+        max_margin = breach_df.loc[breach_df["Margin (°C)"].idxmax()]
+        if max_margin["Margin (°C)"] > 0:
+            thresh_takeaway_parts.append(f"Largest threshold exceedance: **{max_margin['Sensor']}** peaked **{max_margin['Margin (°C)']:.1f}°C** above its limit.")
+    else:
+        thresh_takeaway_parts.append("No threshold breaches detected — all sensors remained within their per-sensor threshold limits.")
+    st.info("📌 **Key Takeaway:** " + " ".join(thresh_takeaway_parts))
+
+    st.divider()
+
+    st.header("Correlation Analysis")
+    st.markdown("_Cross-sensor temperature correlation analysis to identify thermal relationships and co-occurring events._")
+    with st.expander("ℹ️ What is correlation analysis?"):
+        st.markdown("""
+**What it shows:** How temperature readings from different sensors relate to each other over time.
+
+**How to read it:** Correlation values range from -1 to +1. Values close to +1 mean sensors heat up and cool down together. Values close to -1 mean inverse behavior. Values near 0 mean no relationship.
+
+**Why it matters:** Highly correlated sensors may share thermal pathways. Unexpected correlations or lack thereof can reveal insulation issues, airflow patterns, or sensor placement effects.
+""")
+
+    if len(selected_sensors) >= 2:
+        corr_pivot = filtered_df.pivot_table(values="Temperature", index="time", columns="Sensor Id", aggfunc="mean")
+        corr_pivot.columns = [get_label(c) for c in corr_pivot.columns]
+        corr_matrix = corr_pivot.corr()
+
+        corr_col1, corr_col2 = st.columns(2)
+        with corr_col1:
+            st.subheader("Correlation Heatmap")
+            fig_corr = px.imshow(corr_matrix.values,
+                x=list(corr_matrix.columns), y=list(corr_matrix.index),
+                color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+                labels=dict(color="Correlation"),
+                aspect="auto")
+            fig_corr.update_layout(height=max(400, len(corr_matrix) * 40 + 150),
+                template="plotly_white", margin=dict(l=80, r=30, t=40, b=80))
+            st.plotly_chart(fig_corr, use_container_width=True)
+            st.caption("Red = strong positive correlation. Blue = strong negative correlation. White = no correlation.")
+
+        with corr_col2:
+            st.subheader("Same-Type vs Cross-Type Correlation")
+            type_corr_data = []
+            for i_idx, s1 in enumerate(selected_sensors):
+                for j_idx, s2 in enumerate(selected_sensors):
+                    if i_idx >= j_idx:
+                        continue
+                    l1, l2 = get_label(s1), get_label(s2)
+                    t1, t2 = sensor_type_map.get(s1, "Other"), sensor_type_map.get(s2, "Other")
+                    if l1 in corr_matrix.columns and l2 in corr_matrix.columns:
+                        c = corr_matrix.loc[l1, l2]
+                        comp_type = "Same Type" if t1 == t2 else "Cross Type"
+                        type_corr_data.append({
+                            "Pair": f"{l1} — {l2}",
+                            "Correlation": round(c, 3),
+                            "Type 1": t1, "Type 2": t2,
+                            "Comparison": comp_type,
+                        })
+            if type_corr_data:
+                type_corr_df = pd.DataFrame(type_corr_data)
+                fig_type_corr = px.bar(type_corr_df, x="Pair", y="Correlation", color="Comparison",
+                    color_discrete_map={"Same Type": "#3498DB", "Cross Type": "#E8574A"},
+                    labels={"Pair": "Sensor Pair", "Correlation": "Correlation Coefficient"})
+                fig_type_corr.add_hline(y=0, line_dash="solid", line_color="gray", line_width=1)
+                fig_type_corr.update_layout(height=400, template="plotly_white",
+                    xaxis=dict(tickangle=-45), margin=dict(l=40, r=20, t=40, b=100))
+                st.plotly_chart(fig_type_corr, use_container_width=True)
+                st.caption("Blue bars = same sensor type pairs. Red bars = cross-type pairs.")
+            else:
+                st.info("Not enough sensor pairs for comparison.")
+
+        tm_sensors = [s for s in selected_sensors if sensor_type_map.get(s) == "TM"]
+        non_tm_sensors = [s for s in selected_sensors if sensor_type_map.get(s) in ("MSU", "Axle")]
+        if tm_sensors and non_tm_sensors:
+            st.subheader("TM Sensors vs Nearby MSU/Axle Sensors")
+            tm_comparison = []
+            for tm_s in tm_sensors:
+                tm_label = get_label(tm_s)
+                for other_s in non_tm_sensors:
+                    other_label = get_label(other_s)
+                    if tm_label in corr_matrix.columns and other_label in corr_matrix.columns:
+                        c = corr_matrix.loc[tm_label, other_label]
+                        tm_comparison.append({
+                            "TM Sensor": tm_label,
+                            "Compared With": other_label,
+                            "Type": sensor_type_map.get(other_s, "Other"),
+                            "Correlation": round(c, 3),
+                        })
+            if tm_comparison:
+                tm_comp_df = pd.DataFrame(tm_comparison)
+                fig_tm = px.bar(tm_comp_df, x="Compared With", y="Correlation", color="TM Sensor",
+                    barmode="group", labels={"Compared With": "MSU/Axle Sensor", "Correlation": "Correlation"},
+                    color_discrete_sequence=px.colors.qualitative.Set2)
+                fig_tm.update_layout(height=400, template="plotly_white", margin=dict(l=40, r=20, t=40, b=40))
+                st.plotly_chart(fig_tm, use_container_width=True)
+                st.caption("How each TM sensor correlates with nearby MSU and Axle sensors.")
+
+        st.subheader("Spike Co-occurrence Analysis")
+        spike_data_corr = filtered_df.pivot_table(values="Is Spike", index="time", columns="Sensor Id", aggfunc="max").fillna(False).astype(int)
+        spike_data_corr.columns = [get_label(c) for c in spike_data_corr.columns]
+        if spike_data_corr.shape[1] >= 2:
+            co_occur = []
+            cols_list = list(spike_data_corr.columns)
+            for i_idx in range(len(cols_list)):
+                for j_idx in range(i_idx + 1, len(cols_list)):
+                    s1_spikes = spike_data_corr[cols_list[i_idx]]
+                    s2_spikes = spike_data_corr[cols_list[j_idx]]
+                    both = int((s1_spikes & s2_spikes).sum())
+                    either = int((s1_spikes | s2_spikes).sum())
+                    jaccard = round(both / either, 3) if either > 0 else 0
+                    co_occur.append({
+                        "Sensor A": cols_list[i_idx],
+                        "Sensor B": cols_list[j_idx],
+                        "Co-occurring Spikes": both,
+                        "Jaccard Index": jaccard,
+                    })
+            co_occur_df = pd.DataFrame(co_occur).sort_values("Co-occurring Spikes", ascending=False)
+            if co_occur_df["Co-occurring Spikes"].sum() > 0:
+                fig_cooccur = px.bar(co_occur_df.head(15), x="Sensor A", y="Co-occurring Spikes",
+                    color="Sensor B", barmode="group",
+                    labels={"Co-occurring Spikes": "Simultaneous Spikes"},
+                    color_discrete_sequence=px.colors.qualitative.Set2)
+                fig_cooccur.update_layout(height=400, template="plotly_white", margin=dict(l=40, r=20, t=40, b=40))
+                st.plotly_chart(fig_cooccur, use_container_width=True)
+                st.caption("Sensor pairs that experience spikes at the same time. High co-occurrence suggests shared thermal influences.")
+            else:
+                st.info("No co-occurring spike events detected.")
+            st.dataframe(co_occur_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Need at least 2 sensors for spike co-occurrence analysis.")
+
+        corr_takeaway_parts = []
+        upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape, dtype=bool), k=1))
+        avg_corr = upper_tri.stack().mean()
+        corr_takeaway_parts.append(f"Average cross-sensor correlation: **{avg_corr:.3f}**.")
+        max_corr_val = upper_tri.stack().max()
+        max_corr_pair = upper_tri.stack().idxmax()
+        corr_takeaway_parts.append(f"Strongest correlation: **{max_corr_pair[0]}** & **{max_corr_pair[1]}** (r = {max_corr_val:.3f}).")
+        min_corr_val = upper_tri.stack().min()
+        min_corr_pair = upper_tri.stack().idxmin()
+        corr_takeaway_parts.append(f"Weakest correlation: **{min_corr_pair[0]}** & **{min_corr_pair[1]}** (r = {min_corr_val:.3f}).")
+        if avg_corr > 0.7:
+            corr_takeaway_parts.append("High overall correlation suggests sensors share common thermal environments or load patterns.")
+        elif avg_corr < 0.3:
+            corr_takeaway_parts.append("Low overall correlation indicates sensors operate largely independently — different thermal zones or load profiles.")
+        st.info("📌 **Key Takeaway:** " + " ".join(corr_takeaway_parts))
+    else:
+        st.info("Select at least 2 sensors for correlation analysis.")
+
+
 st.header("Export PDF Report")
 st.markdown("_Generate a professional A0-landscape PDF report suitable for poster printing at customer meetings. The report includes one page per sensor plus comparative analysis._")
 with st.expander("ℹ️ About the PDF report"):
@@ -806,7 +1292,13 @@ with st.expander("ℹ️ About the PDF report"):
 1. **Executive Summary** — KPIs, key insights, and operational observations
 2. **Combined Sensor Overview** — All sensors on one chart
 3. **Individual Sensor Pages** — One full page per sensor with detailed analysis
-4. **Comparative Analysis** — Rankings, heatmap, spike analysis, and box plots
+4. **Comparative Analysis** — Rankings and fleet-wide comparison
+5. **Alert Summary** — Per-sensor alerts, daily and monthly alert trends
+6. **Temperature Heatmap** — Sensor × time thermal mapping
+7. **Spike Analysis** — Rate of change analysis and spike detection
+8. **Temperature Distribution** — Histogram and box plot analysis
+9. **Temporal Patterns** — Hourly, daily, and monthly temperature patterns
+10. **Threshold & Correlation Analysis** — Per-sensor thresholds and cross-sensor correlation (when Legend_Master is provided)
 
 **Print recommendations:** Use A0 landscape format for best results. The report is designed as a poster-style document for client presentations.
 """)
@@ -816,7 +1308,9 @@ def generate_pdf_report(filtered_df, alerts_df, sensor_stats, fig_temp_combined,
                         fig_hist, fig_box, fig_roc, fig_heatmap,
                         selected_sensors, total_alerts, total_records,
                         alert_pct, filtered_min_ts, filtered_max_ts,
-                        spike_count, insights_list):
+                        spike_count, insights_list,
+                        has_legend=False, sensor_legend_map=None, sensor_threshold_map=None,
+                        sensor_type_map=None, sensor_description_map=None, legend_df=None):
     from reportlab.lib.units import cm, mm
     from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Image,
                                      Table, TableStyle, PageBreak)
@@ -930,6 +1424,11 @@ def generate_pdf_report(filtered_df, alerts_df, sensor_stats, fig_temp_combined,
     SIDE_H = 900
     HALF_W = W * 0.48
     GAP = W * 0.04
+
+    def pdf_label(sensor_id):
+        if sensor_legend_map:
+            return sensor_legend_map.get(sensor_id, str(sensor_id))
+        return str(sensor_id)
 
     POSTER_FONT = dict(size=36, family="Arial, Helvetica, sans-serif")
     POSTER_TITLE = dict(size=44, family="Arial, Helvetica, sans-serif", color=DARK_TEXT)
@@ -1098,7 +1597,7 @@ def generate_pdf_report(filtered_df, alerts_df, sensor_stats, fig_temp_combined,
         s_max = s_stats["Max Temp (°C)"]
         s_avg = s_stats["Avg Temp (°C)"]
 
-        story.append(Paragraph(f"Sensor {sensor_id}", sensor_page_title))
+        story.append(Paragraph(f"{pdf_label(sensor_id)}", sensor_page_title))
 
         m_cards = [
             [Paragraph(f"{s_min:.1f}°C", metric_val), Paragraph(f"{s_max:.1f}°C", metric_val),
@@ -1175,13 +1674,14 @@ def generate_pdf_report(filtered_df, alerts_df, sensor_stats, fig_temp_combined,
         story.append(Spacer(1, 8))
 
         obs = []
+        slbl = pdf_label(sensor_id)
         td = s_avg - overall_avg
         if abs(td) < 1.0:
-            obs.append(f"Sensor {sensor_id} operates near the fleet average ({overall_avg:.1f}°C).")
+            obs.append(f"{slbl} operates near the fleet average ({overall_avg:.1f}°C).")
         elif td > 0:
-            obs.append(f"Sensor {sensor_id} runs <b>{td:.1f}°C hotter</b> than fleet average ({overall_avg:.1f}°C).")
+            obs.append(f"{slbl} runs <b>{td:.1f}°C hotter</b> than fleet average ({overall_avg:.1f}°C).")
         else:
-            obs.append(f"Sensor {sensor_id} runs <b>{abs(td):.1f}°C cooler</b> than fleet average ({overall_avg:.1f}°C).")
+            obs.append(f"{slbl} runs <b>{abs(td):.1f}°C cooler</b> than fleet average ({overall_avg:.1f}°C).")
         if s_max == overall_max:
             obs.append(f"Recorded the <b>highest peak</b> across all sensors ({s_max:.1f}°C).")
         elif s_max > THRESHOLD:
@@ -1201,19 +1701,37 @@ def generate_pdf_report(filtered_df, alerts_df, sensor_stats, fig_temp_combined,
     story.append(Paragraph("Comparative Analysis", page_title))
     story.append(Paragraph("Sensor performance rankings and fleet-wide comparison.", page_desc))
 
-    tbl_data = [[Paragraph("Sensor Id", table_hdr), Paragraph("Min (°C)", table_hdr),
-                  Paragraph("Max (°C)", table_hdr), Paragraph("Avg (°C)", table_hdr),
-                  Paragraph("Alerts", table_hdr), Paragraph("Spikes", table_hdr)]]
-    for _, row in sensor_stats.iterrows():
-        tbl_data.append([
-            Paragraph(str(row["Sensor Id"]), table_cell_l),
-            Paragraph(f"{row['Min Temp (°C)']:.1f}", table_cell),
-            Paragraph(f"{row['Max Temp (°C)']:.1f}", table_cell),
-            Paragraph(f"{row['Avg Temp (°C)']:.1f}", table_cell),
-            Paragraph(str(row["Alert Events"]), table_cell),
-            Paragraph(str(row["Spike Events"]), table_cell),
-        ])
-    cw = [W*0.22, W*0.15, W*0.15, W*0.15, W*0.15, W*0.15]
+    if has_legend:
+        tbl_data = [[Paragraph("Sensor", table_hdr), Paragraph("Type", table_hdr),
+                      Paragraph("Min (°C)", table_hdr), Paragraph("Max (°C)", table_hdr),
+                      Paragraph("Avg (°C)", table_hdr), Paragraph("Threshold", table_hdr),
+                      Paragraph("Alerts", table_hdr), Paragraph("Spikes", table_hdr)]]
+        for _, row in sensor_stats.iterrows():
+            tbl_data.append([
+                Paragraph(pdf_label(row["Sensor Id"]), table_cell_l),
+                Paragraph(str(row.get("Sensor Type", "")), table_cell),
+                Paragraph(f"{row['Min Temp (°C)']:.1f}", table_cell),
+                Paragraph(f"{row['Max Temp (°C)']:.1f}", table_cell),
+                Paragraph(f"{row['Avg Temp (°C)']:.1f}", table_cell),
+                Paragraph(f"{row.get('Sensor Threshold', THRESHOLD):.0f}°C", table_cell),
+                Paragraph(str(row["Alert Events"]), table_cell),
+                Paragraph(str(row["Spike Events"]), table_cell),
+            ])
+        cw = [W*0.16, W*0.10, W*0.10, W*0.10, W*0.10, W*0.12, W*0.12, W*0.12]
+    else:
+        tbl_data = [[Paragraph("Sensor Id", table_hdr), Paragraph("Min (°C)", table_hdr),
+                      Paragraph("Max (°C)", table_hdr), Paragraph("Avg (°C)", table_hdr),
+                      Paragraph("Alerts", table_hdr), Paragraph("Spikes", table_hdr)]]
+        for _, row in sensor_stats.iterrows():
+            tbl_data.append([
+                Paragraph(str(row["Sensor Id"]), table_cell_l),
+                Paragraph(f"{row['Min Temp (°C)']:.1f}", table_cell),
+                Paragraph(f"{row['Max Temp (°C)']:.1f}", table_cell),
+                Paragraph(f"{row['Avg Temp (°C)']:.1f}", table_cell),
+                Paragraph(str(row["Alert Events"]), table_cell),
+                Paragraph(str(row["Spike Events"]), table_cell),
+            ])
+        cw = [W*0.22, W*0.15, W*0.15, W*0.15, W*0.15, W*0.15]
     stbl = Table(tbl_data, colWidths=cw)
     stbl.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), HexColor(PRIMARY)),
@@ -1230,10 +1748,10 @@ def generate_pdf_report(filtered_df, alerts_df, sensor_stats, fig_temp_combined,
     story.append(Spacer(1, 30))
 
     rk_df = sensor_stats.copy()
-    rk_df["Sensor Id"] = rk_df["Sensor Id"].astype(str)
+    rk_df["Label"] = rk_df["Sensor Id"].map(lambda x: pdf_label(x))
 
     fig_rk1 = px.bar(rk_df.sort_values("Max Temp (°C)", ascending=True),
-        x="Max Temp (°C)", y="Sensor Id", orientation="h",
+        x="Max Temp (°C)", y="Label", orientation="h",
         color="Max Temp (°C)", color_continuous_scale="RdYlGn_r",
         title="Peak Temperature by Sensor")
     fig_rk1.add_vline(x=THRESHOLD, line_dash="dash", line_color="red", line_width=3,
@@ -1243,7 +1761,7 @@ def generate_pdf_report(filtered_df, alerts_df, sensor_stats, fig_temp_combined,
     style_fig(fig_rk1)
 
     fig_rk2 = px.bar(rk_df.sort_values("Spike Events", ascending=True),
-        x="Spike Events", y="Sensor Id", orientation="h",
+        x="Spike Events", y="Label", orientation="h",
         color="Spike Events", color_continuous_scale="YlOrRd",
         title="Spike Events by Sensor")
     fig_rk2.update_layout(template="plotly_white", yaxis_type="category", showlegend=False,
@@ -1266,15 +1784,91 @@ def generate_pdf_report(filtered_df, alerts_df, sensor_stats, fig_temp_combined,
     most_spiky = sensor_stats.loc[sensor_stats["Spike Events"].idxmax()]
     coolest_sensor = sensor_stats.loc[sensor_stats["Avg Temp (°C)"].idxmin()]
     comp_parts = []
-    comp_parts.append(f"<b>Sensor {hottest_sensor['Sensor Id']}</b> recorded the highest peak at <b>{hottest_sensor['Max Temp (°C)']:.1f}°C</b>.")
-    comp_parts.append(f"<b>Sensor {most_spiky['Sensor Id']}</b> is the most volatile with <b>{int(most_spiky['Spike Events'])} spike events</b>.")
-    comp_parts.append(f"<b>Sensor {coolest_sensor['Sensor Id']}</b> has the lowest average temperature ({coolest_sensor['Avg Temp (°C)']:.1f}°C) — the most stable performer.")
+    comp_parts.append(f"<b>{pdf_label(hottest_sensor['Sensor Id'])}</b> recorded the highest peak at <b>{hottest_sensor['Max Temp (°C)']:.1f}°C</b>.")
+    comp_parts.append(f"<b>{pdf_label(most_spiky['Sensor Id'])}</b> is the most volatile with <b>{int(most_spiky['Spike Events'])} spike events</b>.")
+    comp_parts.append(f"<b>{pdf_label(coolest_sensor['Sensor Id'])}</b> has the lowest average temperature ({coolest_sensor['Avg Temp (°C)']:.1f}°C) — the most stable performer.")
     above_thresh = sensor_stats[sensor_stats["Max Temp (°C)"] > THRESHOLD]
     if len(above_thresh) > 0:
         comp_parts.append(f"<b>{len(above_thresh)} of {len(sensor_stats)} sensors</b> exceeded the {THRESHOLD}°C threshold.")
     else:
         comp_parts.append(f"No sensors exceeded the {THRESHOLD}°C threshold — all within safe limits.")
     story.append(make_takeaway_box(" ".join(comp_parts)))
+    story.append(PageBreak())
+
+    # ==================== ALERT SUMMARY ====================
+    story.append(Paragraph("Alert Summary", page_title))
+    story.append(Paragraph(
+        f"Threshold crossing event analysis. {total_alerts} alert events detected across "
+        f"{total_records:,} readings ({alert_pct:.2f}% alert rate).", page_desc))
+
+    if not alerts_df.empty:
+        alerts_per_s = alerts_df.groupby("Sensor Id").size().reset_index(name="Alert Events")
+        alerts_per_s["Label"] = alerts_per_s["Sensor Id"].map(
+            lambda s: pdf_label(s) if has_legend else str(s))
+        fig_alerts_pdf = px.bar(alerts_per_s, x="Label", y="Alert Events",
+                                 color="Alert Events", color_continuous_scale="Reds",
+                                 labels={"Label": "Sensor", "Alert Events": "Alert Events"})
+        fig_alerts_pdf.update_layout(height=500, template="plotly_white",
+                                      xaxis_type="category", margin=dict(l=80, r=40, t=40, b=80))
+        style_fig(fig_alerts_pdf)
+        img = render(fig_alerts_pdf, 1600, 1200)
+        temp_files.append(img)
+
+        alerts_df_copy = alerts_df.copy()
+        alerts_df_copy["Alert Date"] = alerts_df_copy["Alert Time"].dt.date
+        daily_a = alerts_df_copy.groupby("Alert Date").size().reset_index(name="Alert Events")
+        fig_daily_pdf = px.bar(daily_a, x="Alert Date", y="Alert Events",
+                                color_discrete_sequence=["#E45756"])
+        fig_daily_pdf.update_layout(height=500, template="plotly_white",
+                                     margin=dict(l=80, r=40, t=40, b=80))
+        style_fig(fig_daily_pdf)
+        img2 = render(fig_daily_pdf, 1600, 1200)
+        temp_files.append(img2)
+
+        alert_pair = Table(
+            [[Image(img, width=HALF_W, height=SIDE_H),
+              Image(img2, width=HALF_W, height=SIDE_H)]],
+            colWidths=[HALF_W, HALF_W])
+        alert_pair.setStyle(TableStyle([
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("LEFTPADDING", (0,0), (-1,-1), 4),
+            ("RIGHTPADDING", (0,0), (-1,-1), 4),
+        ]))
+        story.append(alert_pair)
+        story.append(Paragraph(
+            "Left: Alert events per sensor. Right: Daily alert trend over time.", caption_style))
+        story.append(Spacer(1, 20))
+
+        alerts_df_copy["Alert Month"] = alerts_df_copy["Alert Time"].dt.to_period("M").astype(str)
+        monthly_a = alerts_df_copy.groupby("Alert Month").size().reset_index(name="Alert Events")
+        fig_monthly_pdf = px.bar(monthly_a, x="Alert Month", y="Alert Events",
+                                  color_discrete_sequence=["#FF6B6B"])
+        fig_monthly_pdf.update_layout(height=500, template="plotly_white",
+                                       margin=dict(l=80, r=40, t=40, b=80))
+        style_fig(fig_monthly_pdf)
+        img3 = render(fig_monthly_pdf, 2400, 1200)
+        temp_files.append(img3)
+        story.append(Image(img3, width=W*0.75, height=SIDE_H))
+        story.append(Paragraph("Monthly alert event trend.", caption_style))
+    else:
+        story.append(Paragraph(
+            "No alert events detected — all sensors remained within safe operating limits "
+            "throughout the monitoring period.", body_large))
+
+    alert_tk_parts = []
+    if total_alerts > 0:
+        alert_s_counts = sensor_stats[["Display Label", "Alert Events"]].sort_values("Alert Events", ascending=False)
+        top_a = alert_s_counts.iloc[0]
+        sensors_with_alerts = int((alert_s_counts["Alert Events"] > 0).sum())
+        alert_tk_parts.append(f"<b>{total_alerts}</b> alert events across <b>{sensors_with_alerts}</b> sensors.")
+        alert_tk_parts.append(f"<b>{top_a['Display Label']}</b> has the most alerts ({int(top_a['Alert Events'])} crossing events).")
+        if alert_pct > 5:
+            alert_tk_parts.append("Alert rate exceeds 5% — systematic thermal issues require investigation.")
+        elif alert_pct < 1:
+            alert_tk_parts.append("Alert rate below 1% — threshold crossings are infrequent.")
+    else:
+        alert_tk_parts.append("No alert events detected — all sensors operated within safe limits.")
+    story.append(make_takeaway_box(" ".join(alert_tk_parts)))
     story.append(PageBreak())
 
     # ==================== HEATMAP ====================
@@ -1500,8 +2094,11 @@ def generate_pdf_report(filtered_df, alerts_df, sensor_stats, fig_temp_combined,
     # ==================== TEMPORAL: HEATMAP + MONTHLY ====================
     story.append(Paragraph("Temporal Patterns — Heatmap & Monthly", page_title))
 
-    tod_hm = filtered_df.pivot_table(values="Temperature", index="Sensor Id",
-        columns=filtered_df["time"].dt.hour, aggfunc="mean")
+    tod_hm = filtered_df.copy()
+    tod_hm["Label"] = tod_hm["Sensor Id"].map(lambda x: pdf_label(x))
+    tod_hm_pivot = tod_hm.pivot_table(values="Temperature", index="Label",
+        columns=tod_hm["time"].dt.hour, aggfunc="mean")
+    tod_hm = tod_hm_pivot
     if not tod_hm.empty:
         fig_thm = px.imshow(tod_hm.values,
             x=[f"{h}:00" for h in tod_hm.columns],
@@ -1587,6 +2184,157 @@ def generate_pdf_report(filtered_df, alerts_df, sensor_stats, fig_temp_combined,
         tm_parts.append("The sensor × hour heatmap above reveals which specific sensor-time combinations run hottest — target these for preventive maintenance.")
     story.append(make_takeaway_box(" ".join(tm_parts)))
 
+    if has_legend and legend_df is not None:
+        story.append(PageBreak())
+        # ==================== SENSOR METADATA SUMMARY ====================
+        story.append(Paragraph("Sensor Metadata Summary", page_title))
+        story.append(Paragraph("Sensor configuration from Legend_Master sheet with threshold values and type classification.", page_desc))
+
+        meta_hdr = [Paragraph("Legend", table_hdr), Paragraph("Sensor UID", table_hdr),
+                     Paragraph("Type", table_hdr), Paragraph("Description", table_hdr),
+                     Paragraph("Threshold (°C)", table_hdr)]
+        meta_data = [meta_hdr]
+        for _, lrow in legend_df.iterrows():
+            leg = str(lrow["Legend"]) if pd.notna(lrow["Legend"]) else ""
+            uid = str(lrow["Sensor UID"]) if pd.notna(lrow["Sensor UID"]) else ""
+            desc = str(lrow["Description"]) if pd.notna(lrow["Description"]) else ""
+            thresh_val = f"{lrow['Threshold Temp']:.0f}" if pd.notna(lrow["Threshold Temp"]) else "N/A"
+            stype = derive_sensor_type(leg) if leg else "Other"
+            meta_data.append([
+                Paragraph(leg, table_cell_l), Paragraph(uid, table_cell),
+                Paragraph(stype, table_cell), Paragraph(desc, table_cell_l),
+                Paragraph(thresh_val, table_cell),
+            ])
+        meta_cw = [W*0.12, W*0.20, W*0.10, W*0.40, W*0.15]
+        meta_tbl = Table(meta_data, colWidths=meta_cw)
+        meta_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), HexColor(PRIMARY)),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [HexColor(BG_CARD), HexColor(BG_LIGHT)]),
+            ("BOX", (0, 0), (-1, -1), 2, HexColor(BORDER)),
+            ("INNERGRID", (0, 0), (-1, -1), 1, HexColor(BORDER)),
+            ("TOPPADDING", (0, 0), (-1, -1), 14),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
+            ("LEFTPADDING", (0, 0), (-1, -1), 14),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 14),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(meta_tbl)
+        story.append(Spacer(1, 30))
+
+        type_counts = sensor_stats["Sensor Type"].value_counts()
+        meta_insight_parts = [f"<b>{len(legend_df)} sensors</b> configured in Legend_Master."]
+        for st_name, cnt in type_counts.items():
+            meta_insight_parts.append(f"{st_name}: <b>{cnt}</b>.")
+        unique_thresholds = sensor_stats["Sensor Threshold"].unique()
+        if len(unique_thresholds) > 1:
+            meta_insight_parts.append(f"Thresholds range from <b>{min(unique_thresholds):.0f}°C</b> to <b>{max(unique_thresholds):.0f}°C</b>.")
+        else:
+            meta_insight_parts.append(f"Uniform threshold of <b>{unique_thresholds[0]:.0f}°C</b> across all sensors.")
+        story.append(make_takeaway_box(" ".join(meta_insight_parts)))
+        story.append(PageBreak())
+
+        # ==================== THRESHOLD ANALYSIS ====================
+        story.append(Paragraph("Threshold Analysis", page_title))
+        story.append(Paragraph("Per-sensor threshold breach analysis using uploaded threshold values.", page_desc))
+
+        breach_chart_data = []
+        for sid in selected_sensors:
+            s_data = filtered_df[filtered_df["Sensor Id"] == sid]
+            s_thresh = sensor_threshold_map.get(sid, THRESHOLD)
+            breach_count = int((s_data["Temperature"] > s_thresh).sum())
+            breach_chart_data.append({
+                "Sensor": pdf_label(sid),
+                "Threshold": s_thresh,
+                "Breach Count": breach_count,
+                "Max Temp": round(s_data["Temperature"].max(), 1),
+            })
+        breach_chart_df = pd.DataFrame(breach_chart_data)
+
+        fig_breach_pdf = px.bar(breach_chart_df, x="Sensor", y="Breach Count",
+            color="Breach Count", color_continuous_scale="Reds",
+            title="Threshold Breach Count by Sensor")
+        fig_breach_pdf.update_layout(template="plotly_white", xaxis_type="category",
+            margin=dict(l=100, r=60, t=90, b=80))
+        style_fig(fig_breach_pdf)
+
+        fig_maxvt_pdf = go.Figure()
+        fig_maxvt_pdf.add_trace(go.Bar(x=breach_chart_df["Sensor"], y=breach_chart_df["Max Temp"],
+            name="Max Temperature", marker_color=BLUE))
+        fig_maxvt_pdf.add_trace(go.Scatter(x=breach_chart_df["Sensor"], y=breach_chart_df["Threshold"],
+            name="Threshold", mode="markers+lines", line=dict(color="red", width=3, dash="dash"),
+            marker=dict(color="red", size=12)))
+        fig_maxvt_pdf.update_layout(template="plotly_white", title="Max Temperature vs Per-Sensor Threshold",
+            yaxis_title="Temperature (°C)", barmode="group",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            margin=dict(l=100, r=60, t=90, b=80))
+        style_fig(fig_maxvt_pdf)
+
+        img_tb1 = render(fig_breach_pdf, 1600, 1200)
+        img_tb2 = render(fig_maxvt_pdf, 1600, 1200)
+        temp_files.extend([img_tb1, img_tb2])
+        tb_pair = Table(
+            [[Image(img_tb1, width=HALF_W, height=SIDE_H), Image(img_tb2, width=HALF_W, height=SIDE_H)]],
+            colWidths=[HALF_W + GAP/2, HALF_W + GAP/2])
+        tb_pair.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP")]))
+        story.append(tb_pair)
+        story.append(Spacer(1, 20))
+
+        total_breaches = sum(b["Breach Count"] for b in breach_chart_data)
+        worst_breach = max(breach_chart_data, key=lambda x: x["Breach Count"])
+        tb_insight = [f"<b>{total_breaches}</b> total threshold breach readings across all sensors."]
+        if worst_breach["Breach Count"] > 0:
+            tb_insight.append(f"<b>{worst_breach['Sensor']}</b> has the most breaches ({worst_breach['Breach Count']} readings above {worst_breach['Threshold']}°C).")
+        no_breach = [b for b in breach_chart_data if b["Breach Count"] == 0]
+        if no_breach:
+            tb_insight.append(f"<b>{len(no_breach)} sensor(s)</b> never exceeded their threshold — operating safely.")
+        story.append(make_takeaway_box(" ".join(tb_insight)))
+        story.append(PageBreak())
+
+        # ==================== CORRELATION ANALYSIS ====================
+        if len(selected_sensors) >= 2:
+            story.append(Paragraph("Correlation Analysis", page_title))
+            story.append(Paragraph("Cross-sensor temperature correlation and spike co-occurrence analysis.", page_desc))
+
+            corr_pivot_pdf = filtered_df.pivot_table(values="Temperature", index="time",
+                columns="Sensor Id", aggfunc="mean")
+            corr_pivot_pdf.columns = [pdf_label(c) for c in corr_pivot_pdf.columns]
+            corr_matrix_pdf = corr_pivot_pdf.corr()
+
+            fig_corr_pdf = px.imshow(corr_matrix_pdf.values,
+                x=list(corr_matrix_pdf.columns), y=list(corr_matrix_pdf.index),
+                color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+                labels=dict(color="Correlation"), aspect="auto")
+            fig_corr_pdf.update_layout(template="plotly_white", title="Temperature Correlation Heatmap",
+                margin=dict(l=120, r=80, t=90, b=100),
+                coloraxis_colorbar=dict(title="Corr", len=0.8))
+            style_fig(fig_corr_pdf)
+            img_corr = render(fig_corr_pdf, 2400, 2000)
+            temp_files.append(img_corr)
+            story.append(Image(img_corr, width=W*0.7, height=MAIN_H))
+            story.append(Paragraph("Red = strong positive correlation. Blue = negative. White = no relationship.", caption_style))
+            story.append(Spacer(1, 20))
+
+            corr_vals = []
+            cols_list_pdf = list(corr_matrix_pdf.columns)
+            for ci in range(len(cols_list_pdf)):
+                for cj in range(ci+1, len(cols_list_pdf)):
+                    corr_vals.append({
+                        "Pair": f"{cols_list_pdf[ci]} — {cols_list_pdf[cj]}",
+                        "Correlation": round(corr_matrix_pdf.iloc[ci, cj], 3),
+                    })
+            if corr_vals:
+                avg_corr = np.mean([c["Correlation"] for c in corr_vals])
+                max_corr = max(corr_vals, key=lambda x: x["Correlation"])
+                min_corr = min(corr_vals, key=lambda x: x["Correlation"])
+                corr_insight = [f"Average cross-sensor correlation: <b>{avg_corr:.3f}</b>."]
+                corr_insight.append(f"Strongest positive: <b>{max_corr['Pair']}</b> ({max_corr['Correlation']:.3f}).")
+                corr_insight.append(f"Weakest/most negative: <b>{min_corr['Pair']}</b> ({min_corr['Correlation']:.3f}).")
+                if avg_corr > 0.7:
+                    corr_insight.append("High average correlation suggests sensors share common thermal influences.")
+                elif avg_corr < 0.3:
+                    corr_insight.append("Low average correlation suggests sensors operate independently.")
+                story.append(make_takeaway_box(" ".join(corr_insight)))
+
     doc.build(story, onFirstPage=draw_page_header_footer, onLaterPages=draw_page_header_footer)
 
     for f in temp_files:
@@ -1605,12 +2353,41 @@ if st.button("Generate PDF Report", type="primary"):
         if not heatmap_pivot.empty:
             heatmap_fig_for_pdf = fig_heatmap
 
+        pdf_fig_combined = go.Figure()
+        y_max_pdf = max(filtered_df["Temperature"].max(), 120)
+        pdf_fig_combined.add_hrect(y0=0, y1=SAFE_LIMIT, fillcolor="green", opacity=0.07, line_width=0)
+        pdf_fig_combined.add_hrect(y0=SAFE_LIMIT, y1=WARNING_LIMIT, fillcolor="orange", opacity=0.07, line_width=0)
+        pdf_fig_combined.add_hrect(y0=WARNING_LIMIT, y1=y_max_pdf * 1.1, fillcolor="red", opacity=0.07, line_width=0)
+        for i, sensor_id in enumerate(selected_sensors):
+            sensor_data = filtered_df[filtered_df["Sensor Id"] == sensor_id]
+            color = colors[i % len(colors)]
+            label = get_label(sensor_id)
+            pdf_fig_combined.add_trace(go.Scatter(x=sensor_data["time"], y=sensor_data["Temperature"],
+                                                    mode="lines", name=label, line=dict(color=color, width=1.5), opacity=0.7))
+            pdf_fig_combined.add_trace(go.Scatter(x=sensor_data["time"], y=sensor_data["Rolling Avg"],
+                                                    mode="lines", name=f"{label} (Avg)",
+                                                    line=dict(color=color, width=2.5, dash="dot"), opacity=0.9))
+        if has_legend:
+            unique_thresholds = set(sensor_threshold_map.get(s, THRESHOLD) for s in selected_sensors)
+            for t_val in sorted(unique_thresholds):
+                pdf_fig_combined.add_hline(y=t_val, line_dash="dash", line_color="red", line_width=2,
+                                             annotation_text=f"Threshold ({t_val}°C)", annotation_position="top right")
+        else:
+            pdf_fig_combined.add_hline(y=THRESHOLD, line_dash="dash", line_color="red", line_width=2,
+                                         annotation_text=f"Threshold ({THRESHOLD}°C)", annotation_position="top right")
+        pdf_fig_combined.update_layout(xaxis_title="Time", yaxis_title="Temperature (°C)", height=500, template="plotly_white",
+                                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                                         margin=dict(l=60, r=30, t=60, b=60))
+
         pdf_bytes = generate_pdf_report(
-            filtered_df, alerts_df, sensor_stats, fig_temp_combined,
+            filtered_df, alerts_df, sensor_stats, pdf_fig_combined,
             fig_hist, fig_box, fig_roc, heatmap_fig_for_pdf,
             selected_sensors, total_alerts, total_records,
             alert_pct, filtered_min_ts, filtered_max_ts,
             spike_count, insights,
+            has_legend=has_legend, sensor_legend_map=sensor_legend_map,
+            sensor_threshold_map=sensor_threshold_map, sensor_type_map=sensor_type_map,
+            sensor_description_map=sensor_description_map, legend_df=legend_df,
         )
 
         st.download_button(
